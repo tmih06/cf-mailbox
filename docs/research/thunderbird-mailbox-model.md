@@ -1,7 +1,7 @@
 # Thunderbird Mailbox Model and Feature Surface
 
 **Date:** 2026-10-13
-**Ticket:** [Research Thunderbird's mailbox model and feature surface (#2)](https://github.com/tmih06/cf-mailbox/issues/2), under [map #1](https://github.com/tmih06/cf-mailbox/issues/1)
+**Ticket:** [Research Thunderbird's mailbox model and feature surface (issue #2)](https://github.com/tmih06/cf-mailbox/issues/2), under the map [Chart a free-tier Cloudflare personal unified mailbox (issue #1)](https://github.com/tmih06/cf-mailbox/issues/1)
 **Scope:** What Thunderbird actually does for Gmail, Outlook.com / Microsoft 365, and generic IMAP/SMTP/POP accounts — identities, folders/labels, sync, threading, search, attachments, sending, authentication, and two-way state changes — plus which of those behaviors can port to a browser-based client hosted on Cloudflare and which cannot be assumed to port.
 
 **Method.** Primary sources only: Mozilla Support (SUMO) knowledge base, Microsoft Learn/Support, Google Workspace developer docs, comm-central source on Searchfox, and IETF RFCs. Each claim cites its owning source at the row or paragraph level. Where a fact could not be verified from a primary source, it is listed under [Limits and unknowns](#limits-and-unknowns) rather than asserted.
@@ -10,9 +10,9 @@
 
 ## 1. Executive summary
 
-Thunderbird is a **local-first, multi-account, multi-protocol mail client**: it stores a full local replica of message metadata (and optionally bodies) per account, keeps that replica synchronized with the provider over IMAP, and layers presentation (folder-pane views, unified inboxes, threaded lists, virtual "Saved Search" folders, the Gloda full-text index) on top of the local replica. Sending is always SMTP or a provider-specific API; identities (From name/address, signature, per-identity copy folders) are per-account configurations, not server objects. Gmail's label model is squeezed into IMAP folders: one Gmail message with N labels materializes as N message copies in Thunderbird, and "archive" = removing the `Inbox` label = moving to `All Mail`. Microsoft-hosted accounts are OAuth-only now, with IMAP/POP3 available but disabled by default on Outlook.com, SMTP AUTH disabled by default for new M365 tenants, and EWS being phased out for M365 in favor of Microsoft Graph (Thunderbird's own EWS path is being replaced in 2026–2027). POP3 exists but is deliberately one-way and is the wrong baseline for this project.
+Thunderbird is a **local-first, multi-account, multi-protocol mail client**: it stores a full local replica of message metadata (and optionally bodies) per account, keeps that replica synchronized with the provider over IMAP, and layers presentation (folder-pane views, unified inboxes, threaded lists, virtual "Saved Search" folders, the Gloda full-text index) on top of the local replica. Sending is always SMTP or a provider-specific API; identities (From name/address, signature, per-identity copy folders) are per-account configurations, not server objects. Gmail's label model is squeezed into IMAP folders: one Gmail message with N labels materializes as N message copies in Thunderbird, and "archive" = removing the `Inbox` label = moving to `All Mail`. Microsoft-hosted accounts require OAuth2 (basic auth is gone); on Outlook.com, IMAP/POP3 are offered but disabled by default, and on Microsoft 365, SMTP AUTH is disabled by default for new tenants; EWS is being phased out for M365 in favor of Microsoft Graph (Thunderbird's own EWS path is being replaced in 2026–2027). POP3 exists but is deliberately one-way — a candidate for explicit exclusion rather than a baseline.
 
-The single most important portability finding: **everything Thunderbird does below the folder-pane UI assumes (a) raw TCP/TLS sockets to arbitrary ports, (b) a persistent process that holds long-lived IMAP connections and IDLE waits, and (c) a local filesystem profile holding mbox/maildir stores, per-folder `.msf` databases, a global SQLite full-text index, and credentials.** A Cloudflare-hosted browser client has none of those natively; the next ticket must decide which behaviors move into Workers/Durable Objects and which must be re-shaped.
+The single most important portability finding: **everything Thunderbird does below the folder-pane UI assumes (a) raw TCP/TLS sockets to arbitrary ports, (b) a persistent process that holds long-lived IMAP connections and IDLE waits, and (c) a local filesystem profile holding mbox/maildir stores, per-folder `.msf` databases, a global full-text index, and credentials.** Whether a browser UI plus Cloudflare Workers runtime can express the same assumptions is unverified at this stage — that is exactly what the next ticket must test, along with which behaviors move into Workers/Durable Objects and which must be re-shaped.
 
 ---
 
@@ -149,39 +149,43 @@ Gmail "does not use a standard IMAP archive folder … archiving simply removes 
 
 | Provider | Mechanism | Evidence |
 |---|---|---|
-| Gmail / Google Workspace | OAuth2 mandatory for third-party IMAP/SMTP — Google ended password-based client auth ("less secure apps") for consumer accounts (announced Jan 2025) and Workspace (March 14, 2025). Thunderbird opens the Google OAuth consent in the system browser (v153+), uses `usePKCE` + `useExternalBrowser`, built-in client ID, scope `https://mail.google.com/` (restricted scope → our own app will need Google OAuth verification or stays in test mode). | [Google: less-secure-apps transition](https://support.google.com/a/answer/14114704); [SUMO: Thunderbird and Gmail](https://support.mozilla.org/en-US/kb/thunderbird-and-gmail); [OAuth2Providers.sys.mjs](https://searchfox.org/comm-central/source/mailnews/base/src/OAuth2Providers.sys.mjs); [Google: restricted scope verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification) |
+| Gmail / Google Workspace | Password-based client auth ("less secure apps") is off for consumer accounts (announced Jan 2025) and Workspace (March 14, 2025); third-party clients use OAuth2 — **with a documented exception: Google "app passwords"** (16-digit codes, only with 2-Step Verification on; not offered for accounts using security-key-only 2SV, Advanced Protection, or some work/school orgs) still work for apps without "Sign in with Google", though Google calls them "not recommended". Thunderbird itself uses OAuth: consent in the system browser (v153+), `usePKCE` + `useExternalBrowser`, built-in client ID, scope `https://mail.google.com/` (a restricted scope; verification paths detailed below). | [Google: less-secure-apps transition](https://support.google.com/a/answer/14114704); [Google: Sign in with app passwords](https://support.google.com/mail/answer/185833?hl=en); [SUMO: Thunderbird and Gmail](https://support.mozilla.org/en-US/kb/thunderbird-and-gmail); [OAuth2Providers.sys.mjs](https://searchfox.org/comm-central/source/mailnews/base/src/OAuth2Providers.sys.mjs); [Google: restricted scope verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification) |
 | Outlook.com / M365 | OAuth2/XOAUTH2 for IMAP, POP, SMTP; basic auth dead in all tenants; admin consent may be needed for org tenants; SMTP AUTH per-mailbox/tenant toggle. Thunderbird uses `/common` endpoints, app `9e5f94bc-…`, `useExternalBrowser: true`. | [Microsoft Learn: OAuth for IMAP/POP/SMTP](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth); [Microsoft Learn: basic-auth deprecation](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/deprecation-of-basic-authentication-exchange-online); [SUMO: Microsoft OAuth 2026](https://support.mozilla.org/en-US/kb/microsoft-oauth-authentication-and-thunderbird-202); [OAuth2Providers.sys.mjs](https://searchfox.org/comm-central/source/mailnews/base/src/OAuth2Providers.sys.mjs) |
 | Generic IMAP/SMTP | Password (PLAIN/LOGIN/CRAM-MD5), OAuth2 for known issuers, client-cert, GSSAPI, NTLM; custom OAuth issuers user-configurable since v156 (or via add-on earlier). | [SUMO: Configuration Options for Accounts](https://support.mozilla.org/en-US/kb/configuration-options-accounts); [SUMO: Custom OAuth](https://support.mozilla.org/en-US/kb/tb-custom-oauth); [nsImapCore.h auth flags](https://searchfox.org/comm-central/source/mailnews/imap/src/nsImapCore.h) |
 | Other known OAuth issuers in Thunderbird | Yahoo, AOL, Fastmail, Mail.ru, Yandex, Seznam, Comcast, tb.pro — each with hard-coded client ID/endpoints, `usePKCE`, some with `clientSecret` and `redirectionEndpoint` (loopback http://localhost). | [OAuth2Providers.sys.mjs](https://searchfox.org/comm-central/source/mailnews/base/src/OAuth2Providers.sys.mjs) |
 
-**OAuth shape for a hosted app:** Thunderbird, as a desktop/native app, legitimately embeds client IDs (and even public "secrets") and opens the system browser, with loopback or no redirect URI. A Cloudflare-hosted web app will be a **web application client**: HTTPS redirect URI, confidential client, tokens stored server-side — matching what Google/Microsoft already require for registered web apps. Owner must register their own Google project and Microsoft Entra app (Thunderbird's IDs cannot be reused; the source says "register one for yourself"). [OAuth2Providers.sys.mjs](https://searchfox.org/comm-central/source/mailnews/base/src/OAuth2Providers.sys.mjs); [Microsoft Learn](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth)
+**OAuth shape for a hosted app:** Thunderbird, as a desktop/native app, legitimately embeds client IDs (and even public "secrets") and opens the system browser, with loopback or no redirect URI. A Cloudflare-hosted web app would register as a **web application client** (HTTPS redirect URI, confidential client, tokens held server-side) — matching what Google and Microsoft already require for registered web apps. Thunderbird's own IDs cannot be reused (the source says "register one for yourself"), so the owner registers their own Google project and Microsoft Entra app; Google offers several states short of full verification — *Testing* (external, ≤100 allowlisted test users, refresh tokens expire after 7 days), *Published–unverified* (any Google user but "Danger" warning UI and a hard 100-user cap), *Verified*, and *Internal* (inside one Workspace org, no verification needed) — plus the app-password escape hatch, so per-instance registration is one of several viable auth models, not the only one; the settled choice belongs to the Cloudflare ticket. [OAuth2Providers.sys.mjs](https://searchfox.org/comm-central/source/mailnews/base/src/OAuth2Providers.sys.mjs); [Microsoft Learn](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth); [Google: OAuth app state overview](https://developers.google.com/identity/protocols/oauth2/production-readiness/overview); [Google: Sign in with app passwords](https://support.google.com/mail/answer/185833?hl=en)
 
 ---
 
 ## 10. What "all features" could mean — capability catalogue
 
-Grouped so the owner can pick a boundary. "Core" = behaviors required by issue #1 (read/send/reply, attachments, search, two-way flags/folders/moves/deletes, multiple mailboxes/identities, history). "Optional" = Thunderbird extras.
+Grouped so the owner can pick a boundary. Two classes: **(A) approved requirements** — the behaviors the map already asks for — and **(B) undecided extras** — additional Thunderbird capabilities that are *not* required and need an explicit yes/no. Nothing in list B should be read as implicitly required.
 
-**Core mailbox behavior (present in Thunderbird, required by the ticket):**
+**(A) Approved requirements (all present in Thunderbird):**
 
-1. Multiple accounts side-by-side; per-account folders, sync, filters, junk, SMTP.
-2. Identities per account; reply auto-picks the identity the sender used; From dropdown across all accounts.
-3. Read/unread, star/flag, spam-mark, archive, delete (with 4 delete models), move/copy across folders *and across accounts*.
-4. Folder subscribe/unsubscribe; folder create/rename/delete propagates to server (IMAP `CREATE/RENAME/DELETE`).
-5. Header-first listing; body-on-demand; background full sync; per-folder sync toggles; disk-space sync caps (recent N days / max size).
-6. IDLE push + poll fallback; startup sync; per-folder "always check" opt-in; queued offline changes.
-7. Threaded view; ignore thread; mass operations on threads.
-8. Compose: HTML/plain, quoting rules, signatures, drafts/templates folders, sent-copy rules, CC/Bcc defaults, Send Later/Outbox.
-9. Attachments in and out; Filelink for large files.
-10. Search: Gloda global FTS over synced bodies + header search over everything + server-side SEARCH for unsynced bodies + Quick Filter + Saved Search virtual folders (cross-account).
-11. Unified folders view + POP global inbox; per-account trees otherwise.
-12. Tags/keywords; Quick Filter dimensions; message columns.
-13. Filters (new-mail/manual/after-send/archive triggers); adaptive spam filter + server-header trust + whitelists.
-14. Import/export (mbox), Local Folders, message storage choice mbox vs maildir.
-15. POP3 with leave-on-server and global inbox.
-16. Account autoconfig via ISPDB/autoconfig XML/manual; multi-auth support incl. custom OAuth.
-17. OpenPGP/S/MIME encryption & signing, return receipts, remote-content blocking — (present in Thunderbird; docs not re-read this pass, catalogued from account-settings surface).
-18. Calendar (CalDAV/lightning-native now), chat/feed/newsgroup accounts, address books (CardDAV/LDAP) — **outside mail scope**; note that Google's OAuth consent in Thunderbird also asks for calendar/contacts scopes, and Microsoft mail accounts surface EWS/Graph paths with no calendar yet.
+1. Multiple mailboxes (accounts) side-by-side; per-account folders, sync, junk, SMTP. [SUMO: Configuration Options for Accounts](https://support.mozilla.org/en-US/kb/configuration-options-accounts)
+2. Read mail: header-first listing, body-on-demand, full sync where enabled. [SUMO: IMAP Synchronization](https://support.mozilla.org/en-US/kb/imap-synchronization)
+3. Send/reply using the original address: identities per account, reply auto-picks the identity the sender used; per-identity From/signature/SMTP. [SUMO: Using Identities](https://support.mozilla.org/en-US/kb/using-identities)
+4. Attachments in and out (standard MIME). [SUMO: IMAP Synchronization](https://support.mozilla.org/en-US/kb/imap-synchronization); [SUMO: Filelink](https://support.mozilla.org/en-US/kb/filelink-large-attachments)
+5. Search across mailboxes: local FTS over synced bodies (Gloda) + header search over everything + optional server-side search. [SUMO: Global Search](https://support.mozilla.org/en-US/kb/global-search); [SUMO: Using Saved Searches](https://support.mozilla.org/en-US/kb/using-saved-searches)
+6. Two-way read-state, folder/label, move, and deletion sync over IMAP (with provider-specific semantics per §4.2–4.3). [SUMO: IMAP vs POP3](https://support.mozilla.org/en-US/kb/difference-between-imap-and-pop3)
+7. Accessible old history via bounded caching: sync caps (recent N days / max size) + per-folder sync opt-in/out + on-demand body fetch for unsynced mail. [SUMO: IMAP Synchronization](https://support.mozilla.org/en-US/kb/imap-synchronization)
+
+**(B) Undecided extras — Thunderbird capabilities NOT covered by the approved requirements (each needs an explicit owner decision):**
+
+8. Folder subscribe/unsubscribe UI; folder create/rename/delete propagation to server. (Basics of "folder sync" are arguably inside (A6); subscription management is the extra.)
+9. Unified folders view + POP Global Inbox + cross-account Saved Search virtual folders — three different "unified" surfaces; the map does not yet define which one(s) "unified mailbox" means.
+10. Threaded view, ignore thread/subthread, per-thread mass actions.
+11. Tags/keywords (beyond read/star), Quick Filter bar, custom message columns.
+12. Message filters/rules (new-mail/manual/after-send/archive triggers) and adaptive Bayesian spam filter + server-header trust.
+13. Compose extras: drafts/templates folders, sent-copy rules, CC/Bcc defaults, quoting/signature placement, HTML compose, Send Later/Outbox queueing, return receipts, remote-content controls.
+14. Filelink large-attachment offload to third-party storage add-ons.
+15. POP3 accounts (leave-on-server, global inbox) — one-way protocol.
+16. Account autoconfig via ISPDB/autoconfig XML vs. manual-only setup; custom OAuth issuer config; non-password auth methods (client-cert, GSSAPI, NTLM).
+17. OpenPGP/S/MIME encryption and signing.
+18. Import/export (mbox), Local Folders, mbox-vs-maildir storage choice.
+19. Calendar (CalDAV), address books (CardDAV/LDAP), chat/feed/newsgroup accounts — outside mail scope; Thunderbird's Google consent asks for calendar/contacts scopes too, and its Exchange/Graph path has no calendar/address book yet. [OAuth2Providers.sys.mjs](https://searchfox.org/comm-central/source/mailnews/base/src/OAuth2Providers.sys.mjs); [SUMO: Thunderbird and Exchange](https://support.mozilla.org/en-US/kb/thunderbird-and-exchange)
 
 ---
 
@@ -198,11 +202,11 @@ Grouped so the owner can pick a boundary. "Core" = behaviors required by issue #
 
 **Unverified portability risks for a Cloudflare-hosted client (facts for the next ticket to test — these are reasonable inferences, not yet proven):**
 
-- **Socket layer:** Workers cannot open arbitrary outbound TCP/TLS in the same way a desktop process does; the IMAP/SMTP path will need `connect()`/sockets support, a WebSocket/TCP relay, or a provider-API (Gmail API, Microsoft Graph) path instead of raw IMAP. Until verified, treat every "client holds an IMAP connection" behavior — IDLE push, per-folder `SELECT`, CONDSTORE, MOVE — as *at risk*.
-- **Process model:** no long-running free-tier process; IDLE and background sync must map to Durable Objects/alarms/queues and re-entrant sync, not a persistent loop. Connection-cache limits (Gmail's 15-connection cap) become an architectural concern across invocations.
-- **Storage:** no local filesystem; mbox/`.msf`/Gloda semantics must map to R2/D1/KV/DO storage + a new index (Vectorize/D1 FTS/Search), and "bounded cache" decisions (sync window, body-on-demand, unsubscribe-equivalent) become cost/latency tradeoffs rather than a disk-space preference.
+- **Socket layer:** unverified whether Workers' outbound-networking capabilities (e.g., `connect()`/TCP sockets) can sustain an IMAP/SMTP session the way a desktop process does. If they cannot, the mail path would need a provider-API route (Gmail API, Microsoft Graph) or another transport — undecided until the Cloudflare ticket tests it. Until verified, treat every "client holds an IMAP connection" behavior — IDLE push, per-folder `SELECT`, CONDSTORE, MOVE — as *at risk*, not impossible.
+- **Process model:** Thunderbird assumes a continuously running process for IDLE, biff timers, background sync, and Outbox flushing. Whether Workers/Durable Objects/alarms/queues can express that loop within free-tier limits is unverified; connection-cache limits (Gmail's documented 15-connection cap) are an architectural concern across invocations either way.
+- **Storage:** Thunderbird assumes a local filesystem (mbox/`.msf`/Gloda). Mapping that to Workers-visible storage (R2/D1/KV/DO) and an index is unverified; "bounded cache" decisions (sync window, body-on-demand, subscription equivalents) become cost/latency tradeoffs rather than a disk-space preference.
 - **Search:** Gloda semantics (stemming, facets, min-term) are reproducible in any FTS, but the "search everything instantly" promise depends on what was synced — the same tradeoff, sharper under free-tier limits.
-- **OAuth:** browser-cookie/http-only-token storage rather than a local credential store; confidential-web-app registration rather than native app + loopback. Google `mail.google.com/` restricted scope implies OAuth verification for a self-hosted distributed app unless each owner registers their own project (issue allows that).
+- **OAuth:** browser-cookie/http-only-token storage rather than a local credential store; confidential-web-app registration rather than native app + loopback. Google's `mail.google.com/` restricted scope has multiple routes (Testing / Published-unverified / Verified / Internal per Workspace, plus app passwords) — settled choice belongs to the Cloudflare ticket, not assumed here.
 - **Per-connection provider quirks:** Gmail delete=label-removal asymmetry, All-Mail duplication, SPECIAL-USE folder mapping, Outlook.com's off-by-default IMAP/POP toggle and suspicious-activity challenge, M365 admin-consent gates and SMTP AUTH default-off — all remain true regardless of where the client runs; a hosted app inherits every one of them.
 - **JMAP:** no production JMAP path in Thunderbird today (source notes JMAP only as a possible future wire format); don't count on JMAP availability for the providers we target. [comm-central folder_storage.md](https://searchfox.org/comm-central/source/mailnews/base/docs/folder_storage.md)
 
@@ -213,7 +217,7 @@ Grouped so the owner can pick a boundary. "Core" = behaviors required by issue #
 1. **IMAP keyword (tag) storage per provider is unverified.** Thunderbird tags map to IMAP keywords where the server supports them, but Gmail's documented folder-based label model and lack of explicit keyword support mean tag persistence on Gmail is *not* confirmed from a primary source this pass. Verify before promising two-way tag sync on Gmail.
 2. **`X-GM-RAW` unused by Thunderbird** — zero comm-central hits; confirms Thunderbird does not leverage Gmail's native search syntax over IMAP, but does not prove the Gmail search gap is unfillable. Next ticket: test server-side `UID SEARCH X-GM-RAW`.
 3. **Exact Gmail connection/UIDVALIDITY behavior under a hosted pool** unverified — only the documented 15-connection cap is primary-sourced.
-4. **Provider message-size limits** (Gmail ~25 MB receive/35 MB send, Outlook ~20–25 MB) — common knowledge, not re-cited from a primary source this pass; confirm in the next ticket.
+4. **Provider message-size limits** exist but were not re-cited from a primary source this pass (numbers removed to avoid asserting approximate values); confirm exact ceilings per provider in the next ticket.
 5. **Ignore-thread, per-message flags like "junk" scores, and some internal flags are local-only MDB state** — not confirmed to round-trip through IMAP flags/keywords for each provider.
 6. **EWS/Graph feature gap in Thunderbird** (no address book/calendar/shared mailboxes/on-prem OAuth yet; email only) is current as of this writing but changing quickly (EWS→Graph migration October 2026–2027). [SUMO: Thunderbird and Exchange](https://support.mozilla.org/en-US/kb/thunderbird-and-exchange); [SUMO: EWS→Graph](https://support.mozilla.org/en-US/kb/microsoft-ews-graph-migration)
 7. **Attachment-content search** — Gloda indexes message bodies; attachment-content indexing is not documented in the pages read; unverified.
@@ -224,7 +228,7 @@ Grouped so the owner can pick a boundary. "Core" = behaviors required by issue #
 
 ## 13. Sharp follow-on decisions for the owner
 
-1. **Feature boundary** — Which of the catalogue rows in §10 are in scope? Suggested split: §10 items 1–12 are the plausible core; 13 (spam/filtering beyond per-account rules), 14 (mbox import/export), 15 (POP3), 16 (autoconfig vs manual-only), 17 (E2E encryption), 18 (calendar/contacts) are the natural cuts to approve or drop explicitly.
+1. **Feature boundary** — §10 splits into approved requirements (A1–A7) and undecided extras (B8–B19). The owner needs to explicitly approve or drop each B row: folder-subscription UI, unified-view flavor(s), threading surface, tags/Quick Filter, filter rules, adaptive spam, compose extras, Filelink, POP3, autoconfig, non-password auth, E2E encryption, import/export, calendar/contacts.
 2. **POP3 support?** One-way, server-destructive-by-default, no two-way anything. Recommend: exclude from v1 unless the owner has a POP-only mailbox that cannot be reached via IMAP.
 3. **Gmail fidelity level** — Do we reproduce the folder-as-label illusion (one message, N views) or expose real labels? Reproducing Thunderbird semantics is simpler over plain IMAP but inherits the duplicate-copy problem in local cache; using `X-GM-EXT-1` (`X-GM-LABELS`, `X-GM-THRID`, `X-GM-RAW`) gives true label/thread/search fidelity but is Gmail-only work.
 4. **Delete model default** — adopt Gmail's "archive ≠ delete" semantics per provider, or expose Thunderbird's four delete models verbatim? The safest default (match Google's recommendation) avoids accidental 30-day permanent deletion via Trash mapping.
@@ -232,7 +236,7 @@ Grouped so the owner can pick a boundary. "Core" = behaviors required by issue #
 6. **Unified-view definition** — Thunderbird merges *like-kind folders* (all Inboxes, all Drafts, …) across accounts, keeps per-account trees too, and adds cross-account Saved Search virtual folders. Which of the three does "unified mailbox" mean for this product?
 7. **Sync window** — Thunderbird's default is sync-everything-with-per-folder-opt-out plus disk-space caps; free-tier will likely require sync-window + body-on-demand. Pick the default window and the reach-back behavior (server-side search over unsynced history?) explicitly.
 8. **Threading model** — local header-based threading (References + subject) is provider-agnostic and reproducible anywhere; Gmail's X-GM-THRID would align threads with the Gmail web view. Choose per provider or uniform?
-9. **OAuth app model** — one owner-registered Google project + Entra app per personal instance (allowed by the ticket), with restricted-scope verification expectations documented, is the only viable path; confirm the owner accepts per-instance registration.
+9. **OAuth app model** — one owner-registered Google project + Entra app per personal instance is allowed by the ticket and matches Thunderbird's "register your own" guidance, but it is not the only option: Google's Testing/Published-unverified/Verified/Internal states and app passwords are documented alternatives with different UX and longevity tradeoffs. Confirm which auth model(s) the owner accepts.
 10. **On-prem/self-hosted Exchange** — out of scope unless the owner needs it; Thunderbird itself notes OAuth gaps there.
 
 ---
@@ -277,7 +281,9 @@ Google (developers.google.com / support.google.com):
 - Gmail IMAP Extensions — https://developers.google.com/workspace/gmail/imap/imap-extensions
 - Choose your IMAP email client settings for Gmail — https://support.google.com/mail/answer/78892?hl=en
 - Transition from less secure apps to OAuth — https://support.google.com/a/answer/14114704
+- Sign in with app passwords — https://support.google.com/mail/answer/185833?hl=en
 - Restricted scope verification — https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification
+- OAuth app state overview — https://developers.google.com/identity/protocols/oauth2/production-readiness/overview
 
 comm-central source (searchfox.org/comm-central):
 - `mailnews/base/src/OAuth2Providers.sys.mjs` — OAuth issuers/scopes/endpoints
